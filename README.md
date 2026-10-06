@@ -1,4 +1,4 @@
-# GTA San Andreas Stats On Vehicles + Percentage Mod
+# GTA San Andreas Stats On Vehicles And Percentage Mod
 
 This mod allows you to open the stats window while inside a vehicle. When you open it inside a vehicle, your skill level for that specific vehicle is displayed in the stats window. This is inspired by the mobile version of the game, but the stats window position is the same as in the original game.
 
