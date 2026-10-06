@@ -1,32 +1,40 @@
 // VehicleStats.cpp - GTA San Andreas 1.0 US (includes "compact"/Hoodlum exe)
 //
 // Quick statistics screen also inside vehicles:
-//  - Inside a vehicle: opens with the .ini key (default TAB) or with LEFT D-pad
+//  - Inside the vehicle: opens with the .ini key (default TAB) or with the LEFT D-pad
 //    (reads the game's own CPad, so it works with GInput). On foot: same as the original game.
-//  - Position: by default the screen stays in its original position (on foot and in a vehicle). With
-//    MoveToTop = 1 in the .ini it moves to the top, centered, both on foot AND in a vehicle.
-//  - Inside a vehicle, the "Stamina" row becomes the skill of the current vehicle, with the
+//  - Inside the vehicle, the "Stamina" line becomes the current vehicle's skill, with the
 //    same bar/value as the game's statistic:
-//        car/truck/quad -> driving skill       (stat 160, text STAT160)
+//        car/truck/quad -> driving skill        (stat 160, text STAT160)
 //        motorcycle (subclass 9) -> motorcycle skill (stat 229, text STAT229)
 //        bicycle (BMX, 10) -> cycling skill     (stat 230, text STAT230)
-//        airplane/helicopter -> flying skill    (stat 223, text STAT223)
+//        plane/helicopter -> flying skill       (stat 223, text STAT223)
 //        boat/train/trailer -> remains "Stamina"
+//  - Optional (ShowPercent = 1 in the .ini): shows the percentage in the RIGHT corner, inside each
+//    bar: in the quick window, in the statistics screen of the pause menu, and in the top notification
+//    that appears when a skill is increased.
 //
-// Everything confirmed in gta_sa.exe 1.0 US:
-//   CHud::Draw (original section):
+// Everything confirmed on gta_sa.exe 1.0 US:
+//   CHud::Draw (original code):
 //     58FC24  call CPad::GetDisplayVitalStats
-//     58FC29  test ax,ax / je 58FC4C        <- these 5 bytes are replaced with a JMP to Stub1
+//     58FC29  test ax,ax / je 58FC4C        <- these 5 bytes become a JMP to Stub1
 //     58FC32  call FindPlayerVehicle         <- redirected to FindVehHook
-//   CHud::DrawVitalStats = 0x589650..0x58A158. Inside it:
-//     CMenuManager::DrawWindow 0x573EE0 (2 calls), CFont::PrintString 0x71A700 (8),
-//     CSprite2d::DrawBarChart 0x728640 (6): receive the offset used for centering.
+//   CHud::DrawVitalStats = 0x589650..0x58A158: 6 calls to CSprite2d::DrawBarChart (0x728640).
 //     Stamina line: text at 0x589CD8 (CText::Get, key STAT022) and value at
 //     0x589D30 (CStats::GetStatValue, id 0x16).
-//   m_nVehicleSubClass = vehicle+0x594: 0 car, 1 monster, 2 quad, 3 heli, 4 airplane, 5 boat,
-//     6 train, 7 fake heli, 8 fake airplane, 9 motorcycle, 10 bicycle (BMX), 11 trailer.
+//   Statistics screen in the pause menu: DrawBarChart at 0x574F54 (inside the routine that
+//     draws each statistic line that has a bar).
+//   Top notification when a statistic/skill increases: DrawBarChart at 0x58BFB8
+//     (routine that builds the "STAT%d" text with the "+" sign; both paths go through this
+//     single call).
+//   DrawBarChart(x, y, width, height, progress 0..100, add, percentage, border, color, color2):
+//     the game itself has a percentage text ("percentage" argument), but places it at the end
+//     of the filled portion; therefore the plugin draws the text in the right corner using CFont,
+//     saving and restoring the font state (0xC71A60..0xC71AA7) so it does not affect other text.
+//   m_nVehicleSubClass = vehicle+0x594: 0 car, 1 monster, 2 quad, 3 heli, 4 plane, 5 boat,
+//     6 train, 7 fake heli, 8 fake plane, 9 motorcycle, 10 bicycle (BMX), 11 trailer.
 //
-// Compile as Win32 (x86), with MSVC. The output should be named VehicleStats.asi
+// Compile as Win32 (x86), with MSVC. The output must be named VehicleStats.asi
 #include <windows.h>
 #include <cstdarg>
 #include <cstdio>
@@ -44,19 +52,34 @@ static const uintptr_t GET_PAD        = 0x53FB70;  // CPad* CPad::GetPad(int)
 
 static const uintptr_t VS_LO          = 0x589650;  // CHud::DrawVitalStats
 static const uintptr_t VS_HI          = 0x58A158;
-static const uintptr_t FN_PRINT       = 0x71A700;  // CFont::PrintString(float,float,ushort*)
 static const uintptr_t FN_BAR         = 0x728640;  // CSprite2d::DrawBarChart(...)
-static const uintptr_t FN_WINDOW      = 0x573EE0;  // CMenuManager::DrawWindow(...)
+static const uintptr_t SITE_MENU_BAR  = 0x574F54;  // DrawBarChart on the statistics menu screen
+static const uintptr_t SITE_NOTIF_BAR = 0x58BFB8;  // DrawBarChart in the top notification (skill increased)
 static const uintptr_t FN_TEXTGET     = 0x6A0050;  // CText::Get(char*)
 static const uintptr_t FN_STATVALUE   = 0x558E40;  // CStats::GetStatValue(ushort)
 static const uintptr_t SITE_STAMINA_TXT  = 0x589CD8;
 static const uintptr_t SITE_STAMINA_STAT = 0x589D30;
 static const uintptr_t KEY_STAT022    = 0x866BE4;  // "STAT022" (Stamina)
-static const uintptr_t SCREEN_W       = 0xC17044;  // RsGlobal.maximumWidth  (int)
-static const uintptr_t SCREEN_H       = 0xC17048;  // RsGlobal.maximumHeight (int)
 static const int       OFF_SUBCLASS   = 0x594;
 
-static uintptr_t kCont = 0x58FC2E;   // continue: check whether the player is in a vehicle
+// CFont (all confirmed in the exe)
+static const uintptr_t FN_SETSCALE    = 0x719380;  // (float x, float y)
+static const uintptr_t FN_SETCOLOR    = 0x719430;  // (CRGBA as dword)
+static const uintptr_t FN_SETSTYLE    = 0x719490;  // (byte)
+static const uintptr_t FN_SETWRAPX    = 0x7194D0;  // (float)
+static const uintptr_t FN_SETRJWRAP   = 0x7194F0;  // (float)
+static const uintptr_t FN_SETDROPCOL  = 0x719510;  // (CRGBA as dword)
+static const uintptr_t FN_SETDROPPOS  = 0x719590;  // (byte)
+static const uintptr_t FN_SETPROP     = 0x7195B0;  // SetProportional(byte)
+static const uintptr_t FN_SETBACK     = 0x7195C0;  // SetBackground(byte, byte)
+static const uintptr_t FN_SETJUSTIFY  = 0x719600;  // SetJustify(byte)
+static const uintptr_t FN_SETORIENT   = 0x719610;  // (byte) 0 center, 1 left, 2 right
+static const uintptr_t FN_PRINT       = 0x71A700;  // (float x, float y, ushort* text)
+static const uintptr_t FN_STRWIDTH    = 0x71A0E0;  // float (ushort* text, bool, bool)
+static const uintptr_t FONT_STATE     = 0xC71A60;  // CFont state block
+static const size_t    FONT_STATE_LEN = 0x48;
+
+static uintptr_t kCont = 0x58FC2E;   // continue: check if player is in a vehicle
 static uintptr_t kSkip = 0x58FC4C;   // skip: draw the radar normally
 
 // ---------------- Configuration ----------------
@@ -65,10 +88,9 @@ static bool  g_useKey   = true;
 static bool  g_usePad   = true;
 static int   g_vk       = VK_TAB;
 static int   g_padIdx   = 10;      // index (in shorts) in CControllerState; 10 = D-pad left
-static bool  g_center   = false;   // MoveToTop: screen at the top (on foot and in a vehicle)
-static float g_topMargin = 30.0f;  // distance from the top (640x448 units)
-static float g_offsetX   = 0.0f;   // extra horizontal offset (640 units)
 static bool  g_skillRow = true;
+static bool  g_percent  = false;
+static float g_textScale = 1.0f;
 
 struct PadBtn { const char* name; int idx; };
 static const PadBtn kPad[] = {
@@ -126,10 +148,11 @@ static void LoadConfig()
     for (const PadBtn& b : kPad)
         if (!_stricmp(buf, b.name)) { g_padIdx = b.idx; break; }
 
-    g_center    = GetPrivateProfileIntA("Layout", "MoveToTop", 0, g_iniPath) != 0;
-    g_topMargin = ReadFloat("Layout", "TopMargin", 30.0f);
-    g_offsetX   = ReadFloat("Layout", "OffsetX", 0.0f);
     g_skillRow  = GetPrivateProfileIntA("Layout", "SkillRow", 1, g_iniPath) != 0;
+    g_percent   = GetPrivateProfileIntA("Percent", "ShowPercent", 0, g_iniPath) != 0;
+    g_textScale = ReadFloat("Percent", "TextScale", 1.0f);
+    if (g_textScale < 0.2f) g_textScale = 0.2f;
+    if (g_textScale > 5.0f) g_textScale = 5.0f;
 }
 
 // ---------------- Log ----------------
@@ -147,7 +170,6 @@ static void Log(const char* fmt, ...)
 
 // ---------------- Current drawing state ----------------
 static bool        g_vehMode  = false;     // drawing the screen INSIDE a vehicle
-static float       g_dx = 0.0f, g_dy = 0.0f;
 static unsigned    g_skillId  = 0;         // 0 = keep Stamina
 static const char* g_skillKey = nullptr;
 
@@ -165,7 +187,7 @@ static void ChooseSkill(void* veh)
     switch (sub)
     {
         case 0: case 1: case 2:         g_skillId = 160; g_skillKey = kKey160; break; // car, truck, quad
-        case 3: case 4: case 7: case 8: g_skillId = 223; g_skillKey = kKey223; break; // heli/airplane
+        case 3: case 4: case 7: case 8: g_skillId = 223; g_skillKey = kKey223; break; // heli/plane
         case 9:                         g_skillId = 229; g_skillKey = kKey229; break; // motorcycle
         case 10:                        g_skillId = 230; g_skillKey = kKey230; break; // bicycle (BMX)
         default: break;                                                               // boat(5), train(6), trailer(11)
@@ -213,7 +235,7 @@ static bool __cdecl ForceNow()
         if (g_logForce < 20)
         {
             ++g_logForce;
-            Log("Trigger (vehicle) %s", t ? "PRESSED" : "released");
+            Log("Vehicle trigger %s", t ? "PRESSED" : "released");
         }
     }
     return t;
@@ -221,7 +243,7 @@ static bool __cdecl ForceNow()
 
 // ---------------- CHud::Draw hooks ----------------
 // Replaces "test ax,ax / je 58FC4C": if the game already said "yes", continue normally;
-// if it said "no" but our trigger (in a vehicle) is active, continue as if it said "yes".
+// if it said "no" but our trigger (inside a vehicle) is active, continue as if it were "yes".
 __declspec(naked) static void Stub1()
 {
     __asm {
@@ -238,12 +260,11 @@ __declspec(naked) static void Stub1()
 }
 
 // Call at 58FC32: tells the game that there is NO vehicle while the trigger is active,
-// and prepares "inside vehicle" mode (position and skill row).
+// and prepares the "inside vehicle" mode (skill line).
 static void* __cdecl FindVehHook(int player, bool remote)
 {
     void* v = ((void* (__cdecl*)(int, bool))FIND_VEHICLE)(player, remote);
     g_vehMode = false;
-    g_dx = g_dy = 0.0f;
     g_skillId = 0;
     g_skillKey = nullptr;
     if (v && ForceNow())
@@ -261,62 +282,86 @@ static void* __cdecl FindVehHook(int player, bool remote)
     return v;
 }
 
-// ---------------- Hooks inside CHud::DrawVitalStats ----------------
-typedef void (__thiscall *DrawWindow_t)(void* self, float* rect, const char* key, unsigned char color,
-                                        unsigned int backColor, unsigned char unused, unsigned char bg);
-typedef void (__cdecl *Print_t)(float x, float y, unsigned short* text);
-typedef void (__cdecl *Bar_t)(float x, float y, unsigned short w, unsigned char h, float progress,
-                              signed char add, unsigned char pct, unsigned char border,
-                              unsigned int fore, unsigned int back);
+// ---------------- Skill line (inside CHud::DrawVitalStats) ----------------
 typedef const void* (__thiscall *TextGet_t)(void* self, const char* key);
 typedef float (__cdecl *StatValue_t)(unsigned short id);
 
-// DrawWindow draws the background/title and receives the rectangle: with MoveToTop = 1 we calculate here
-// the offset that centers the window at the top and use the already-offset rectangle.
-static void __fastcall HookWindow(void* self, void* /*edx*/, float* rect, const char* key, unsigned char color,
-                                  unsigned int backColor, unsigned char unused, unsigned char bg)
-{
-    float r[4] = { rect[0], rect[1], rect[2], rect[3] };
-    if (g_center)
-    {
-        float sw = (float)*(volatile int*)SCREEN_W;
-        float sh = (float)*(volatile int*)SCREEN_H;
-        float cx   = (rect[0] + rect[2]) * 0.5f;                 // left, bottom, right, top
-        float topY = rect[1] < rect[3] ? rect[1] : rect[3];
-        g_dx = sw * 0.5f - cx + g_offsetX * sw / 640.0f;
-        g_dy = g_topMargin * sh / 448.0f - topY;
-        r[0] += g_dx; r[2] += g_dx;
-        r[1] += g_dy; r[3] += g_dy;
-    }
-    ((DrawWindow_t)FN_WINDOW)(self, r, key, color, backColor, unused, bg);
-}
-
-static void __cdecl HookPrint(float x, float y, unsigned short* text)
-{
-    if (g_center) { x += g_dx; y += g_dy; }
-    ((Print_t)FN_PRINT)(x, y, text);
-}
-
-static void __cdecl HookBar(float x, float y, unsigned short w, unsigned char h, float progress,
-                            signed char add, unsigned char pct, unsigned char border,
-                            unsigned int fore, unsigned int back)
-{
-    if (g_center) { x += g_dx; y += g_dy; }
-    ((Bar_t)FN_BAR)(x, y, w, h, progress, add, pct, border, fore, back);
-}
-
-// Stamina row text -> vehicle skill name
+// Stamina line text -> vehicle skill name
 static const void* __fastcall HookTextGet(void* self, void* /*edx*/, const char* key)
 {
     if (g_vehMode && g_skillKey && key == (const char*)KEY_STAT022) key = g_skillKey;
     return ((TextGet_t)FN_TEXTGET)(self, key);
 }
 
-// Stamina row value -> vehicle skill value
+// Stamina line value -> vehicle skill value
 static float __cdecl HookStat(unsigned short id)
 {
     if (g_vehMode && g_skillId && id == 0x16) id = (unsigned short)g_skillId;
     return ((StatValue_t)FN_STATVALUE)(id);
+}
+
+// ---------------- Percentage in the right corner of the bars ----------------
+typedef void  (__cdecl *Bar_t)(float x, float y, int w, int h, float progress,
+                               int add, int pct, int border, unsigned int fore, unsigned int back);
+typedef void  (__cdecl *FSet2_t)(float, float);
+typedef void  (__cdecl *FSet1f_t)(float);
+typedef void  (__cdecl *FSetDw_t)(unsigned int);
+typedef void  (__cdecl *FSetB_t)(int);
+typedef void  (__cdecl *FSetB2_t)(int, int);
+typedef void  (__cdecl *FPrint_t)(float, float, unsigned short*);
+typedef float (__cdecl *FWidth_t)(unsigned short*, bool, bool);
+
+static void DrawPercent(float x, float y, int w, int h, float progress)
+{
+    if (w <= 0 || h <= 0) return;
+
+    int pct = (int)progress;
+    if (pct < 0) pct = 0;
+    if (pct > 100) pct = 100;
+
+    char ascii[16];
+    sprintf(ascii, "%d%%", pct);
+    unsigned short text[16];
+    int n = 0;
+    for (; ascii[n] && n < 15; ++n) text[n] = (unsigned short)(unsigned char)ascii[n];
+    text[n] = 0;
+
+    // Save the font state (subsequent text depends on it)
+    uint8_t saved[FONT_STATE_LEN];
+    memcpy(saved, (const void*)FONT_STATE, FONT_STATE_LEN);
+
+    float scaleX = (float)h * 0.03f * g_textScale;     // same proportion as the game's own text
+    float scaleY = (float)h * 0.04f * g_textScale;
+
+    ((FSetDw_t)FN_SETCOLOR)(0xFFFFFFFFu);              // white
+    ((FSetDw_t)FN_SETDROPCOL)(0xFF000000u);            // black shadow
+    ((FSetB_t) FN_SETDROPPOS)(1);
+    ((FSetB_t) FN_SETSTYLE)(1);
+    ((FSetB_t) FN_SETPROP)(1);                         // proportional font (same as the game's window)
+    ((FSetB_t) FN_SETJUSTIFY)(0);
+    ((FSetB2_t)FN_SETBACK)(0, 0);                      // no text background
+    ((FSetB_t) FN_SETORIENT)(1);                       // left-aligned (position calculated manually)
+    ((FSet1f_t)FN_SETWRAPX)(10000.0f);
+    ((FSet1f_t)FN_SETRJWRAP)(0.0f);
+    ((FSet2_t) FN_SETSCALE)(scaleX, scaleY);
+
+    float tw = ((FWidth_t)FN_STRWIDTH)(text, true, true);
+    // RIGHT corner inside the bar (with a small gap to avoid touching the edge)
+    float pad = (float)h * 0.3f;
+    if (pad < 2.0f) pad = 2.0f;
+    float px = x + (float)w - tw - pad;
+    if (px < x) px = x;                                // text too wide: keep it from going past the left edge
+    float py = y + 2.0f;
+    ((FPrint_t)FN_PRINT)(px, py, text);
+
+    memcpy((void*)FONT_STATE, saved, FONT_STATE_LEN);  // restore the font state
+}
+
+static void __cdecl HookBar(float x, float y, int w, int h, float progress,
+                            int add, int pct, int border, unsigned int fore, unsigned int back)
+{
+    ((Bar_t)FN_BAR)(x, y, w & 0xFFFF, h & 0xFF, progress, add, 0 /* no native text */, border, fore, back);
+    if (g_percent) DrawPercent(x, y, w & 0xFFFF, h & 0xFF, progress);
 }
 
 // ---------------- Initialization ----------------
@@ -386,8 +431,8 @@ BOOL APIENTRY DllMain(HMODULE hm, DWORD reason, LPVOID)
     }
 
     LoadConfig();
-    Log("Config: enabled=%d key=%d(vk=0x%02X) pad=%d(idx=%d) moveToTop=%d top=%.1f skill=%d",
-        g_enabled, g_useKey, g_vk, g_usePad, g_padIdx, g_center, g_topMargin, g_skillRow);
+    Log("Config: enabled=%d key=%d(vk=0x%02X) pad=%d(idx=%d) skill=%d percentage=%d scale=%.2f",
+        g_enabled, g_useKey, g_vk, g_usePad, g_padIdx, g_skillRow, g_percent, g_textScale);
 
     // Check the original bytes before modifying anything
     static const uint8_t expectTest[5] = { 0x66, 0x85, 0xC0, 0x74, 0x1E };
@@ -409,42 +454,46 @@ BOOL APIENTRY DllMain(HMODULE hm, DWORD reason, LPVOID)
 
     bool ok1 = WriteCall(VEH_CALL_SITE, (void*)&FindVehHook);
     bool ok2 = WriteJmp(TEST_SITE, (void*)&Stub1);
-    Log("Patch: vehicle check=%s, button check=%s",
+    Log("Patch: vehicle check=%s, button test=%s",
         ok1 ? "OK" : "FAILED", ok2 ? "OK" : "FAILED");
 
-    // ---- Layout (center at the top) ----
-    if (g_center)
-    {
-        int nPrint = CountCalls(FN_PRINT), nBar = CountCalls(FN_BAR), nWin = CountCalls(FN_WINDOW);
-        if (nPrint == 8 && nBar == 6 && nWin == 2)
-        {
-            int a = PatchCalls(FN_WINDOW, (void*)&HookWindow);
-            int b = PatchCalls(FN_PRINT,  (void*)&HookPrint);
-            int c = PatchCalls(FN_BAR,    (void*)&HookBar);
-            Log("Layout: window=%d text=%d bars=%d calls redirected", a, b, c);
-        }
-        else
-        {
-            g_center = false;
-            Log("Layout NOT applied: unexpected count (text=%d bars=%d window=%d; expected 8/6/2).",
-                nPrint, nBar, nWin);
-        }
-    }
-
-    // ---- Skill row (replaces Stamina) ----
+    // ---- Skill line (replaces Stamina) ----
     if (g_skillRow)
     {
         if (CallTarget(SITE_STAMINA_TXT) == FN_TEXTGET && CallTarget(SITE_STAMINA_STAT) == FN_STATVALUE)
         {
             bool a = WriteCall(SITE_STAMINA_TXT,  (void*)&HookTextGet);
             bool b = WriteCall(SITE_STAMINA_STAT, (void*)&HookStat);
-            Log("Skill row: text=%s value=%s", a ? "OK" : "FAILED", b ? "OK" : "FAILED");
+            Log("Skill line: text=%s value=%s", a ? "OK" : "FAILED", b ? "OK" : "FAILED");
         }
         else
         {
             g_skillRow = false;
-            Log("Skill row NOT applied: stamina calls differ from expected.");
+            Log("Skill line NOT applied: stamina calls differ from expected.");
         }
+    }
+
+    // ---- Percentage in the bars (quick window + pause menu) ----
+    if (g_percent)
+    {
+        int nBar = CountCalls(FN_BAR);
+        if (nBar == 6)
+        {
+            int c = PatchCalls(FN_BAR, (void*)&HookBar);
+            Log("Percentage (quick window): %d bars", c);
+        }
+        else
+            Log("Percentage NOT applied in quick window: unexpected bar count (%d, expected 6).", nBar);
+
+        if (CallTarget(SITE_MENU_BAR) == FN_BAR)
+            Log("Percentage (pause menu): %s", WriteCall(SITE_MENU_BAR, (void*)&HookBar) ? "OK" : "FAILED");
+        else
+            Log("Percentage NOT applied in pause menu: call at 0x%08X differs from expected.", (unsigned)SITE_MENU_BAR);
+
+        if (CallTarget(SITE_NOTIF_BAR) == FN_BAR)
+            Log("Percentage (skill increased notification): %s", WriteCall(SITE_NOTIF_BAR, (void*)&HookBar) ? "OK" : "FAILED");
+        else
+            Log("Percentage NOT applied in skill notification: call at 0x%08X differs from expected.", (unsigned)SITE_NOTIF_BAR);
     }
     return TRUE;
 }
